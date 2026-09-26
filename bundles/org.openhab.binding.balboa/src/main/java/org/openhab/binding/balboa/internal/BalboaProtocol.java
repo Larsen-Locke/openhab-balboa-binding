@@ -293,7 +293,8 @@ public class BalboaProtocol {
                     // The write session has been stuck for a while (the watchdog will eventually notice
                     // the accompanying read silence and force a reconnect). Drop the new message instead
                     // of growing the queue without bound.
-                    logger.warn("Outgoing message queue is full ({} messages), dropping message - the connection may be stuck",
+                    logger.warn(
+                            "Outgoing message queue is full ({} messages), dropping message - the connection may be stuck",
                             MAX_QUEUE_SIZE);
                     return;
                 }
@@ -620,6 +621,10 @@ public class BalboaProtocol {
                     // We are connected, but not configured yet. Request the information and update status
                     writer.sendMessage(new BalboaMessage.SettingsRequestMessage(SettingsType.INFORMATION));
                     writer.sendMessage(new BalboaMessage.SettingsRequestMessage(SettingsType.PANEL));
+                    // Also request the filter cycle configuration and the most recent fault log entry, so those
+                    // channels have a value right after connecting instead of waiting for the first poll.
+                    writer.sendMessage(new BalboaMessage.SettingsRequestMessage(SettingsType.FILTER_CYCLES));
+                    writer.sendMessage(new BalboaMessage.SettingsRequestMessage(SettingsType.FAULT_LOG));
                     setStatus(Status.CONFIGURATION_PENDING, "Configuration request sent");
 
                     // Start the reader

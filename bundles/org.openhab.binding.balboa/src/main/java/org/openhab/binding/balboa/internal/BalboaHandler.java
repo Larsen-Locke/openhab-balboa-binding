@@ -12,6 +12,9 @@
  */
 package org.openhab.binding.balboa.internal;
 
+import java.time.ZonedDateTime;
+import java.util.Comparator;
+import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.ThreadLocalRandom;
@@ -26,6 +29,7 @@ import org.openhab.binding.balboa.internal.BalboaMessage.PanelConfigurationRespo
 import org.openhab.binding.balboa.internal.BalboaMessage.SettingsRequestMessage.SettingsType;
 import org.openhab.binding.balboa.internal.BalboaProtocol.Handler;
 import org.openhab.binding.balboa.internal.BalboaProtocol.Status;
+import org.openhab.core.library.types.DateTimeType;
 import org.openhab.core.library.types.OnOffType;
 import org.openhab.core.library.types.OpenClosedType;
 import org.openhab.core.library.types.QuantityType;
@@ -182,6 +186,9 @@ public class BalboaHandler extends BaseThingHandler implements Handler {
             logger.trace("Polling the unit");
             // Send an information request
             protocol.sendMessage(new BalboaMessage.SettingsRequestMessage(SettingsType.INFORMATION));
+            // Also refresh the fault log, so a newly logged fault shows up on the fault-code/fault-time channels
+            // without needing a reconnect.
+            protocol.sendMessage(new BalboaMessage.SettingsRequestMessage(SettingsType.FAULT_LOG));
         }
     }
 
@@ -418,10 +425,37 @@ public class BalboaHandler extends BaseThingHandler implements Handler {
             channels.addChannel(new TemperatureRange());
             channels.addChannel(new HeatMode());
             channels.addChannel(new FilterStatus());
+            channels.addChannel(new LastSeenChannel());
+
+            // Plain Switch views of Temperature Range and Heat Mode, so a Switch item can be linked directly to
+            // the channel without a second item plus a profile transforming the String channel to ON/OFF.
+            channels.addChannel(new TemperatureRangeSwitch());
+            channels.addChannel(new HeatModeSwitch());
+
+            // Independent per-range desired target temperatures (see DesiredTemperatureChannel for why this
+            // needs to be its own thing, rather than just reading/writing the plain target-temperature channel).
+            channels.addChannel(
+                    new DesiredTemperatureChannel(true, "target-temperature-high", "Target Temperature (High)"));
+            channels.addChannel(
+                    new DesiredTemperatureChannel(false, "target-temperature-low", "Target Temperature (Low)"));
             channels.addChannel(new ContactChannel(ItemType.PRIMING, "priming", "Priming", "priming"));
             channels.addChannel(
                     new ContactChannel(ItemType.CIRCULATION, "circulation", "Circulation Pump", "circulation"));
             channels.addChannel(new ContactChannel(ItemType.HEATER, "heater", "Heater", "heater"));
+
+            // Fault log (most recent entry) and filter cycle configuration. These are not reported in the panel
+            // configuration message, so unlike the items below they are unconditionally always present.
+            channels.addChannel(new FaultCodeChannel());
+            channels.addChannel(new FaultTimeChannel());
+            channels.addChannel(
+                    new FilterCycleTimeChannel(1, FilterCycleField.START, "filter-1-start", "Filter Cycle 1 Start"));
+            channels.addChannel(new FilterCycleTimeChannel(1, FilterCycleField.DURATION, "filter-1-duration",
+                    "Filter Cycle 1 Duration"));
+            channels.addChannel(
+                    new FilterCycleTimeChannel(2, FilterCycleField.START, "filter-2-start", "Filter Cycle 2 Start"));
+            channels.addChannel(new FilterCycleTimeChannel(2, FilterCycleField.DURATION, "filter-2-duration",
+                    "Filter Cycle 2 Duration"));
+            channels.addChannel(new Filter2EnabledChannel());
 
             // Add pumps based on the configuration message. These can be one- or two-speed (Switch or OFF/LOW/HIGH).
             // TODO: Two-speed pumps have not been tested (need a user with such items in the unit)
@@ -498,10 +532,11 @@ public class BalboaHandler extends BaseThingHandler implements Handler {
 
             // Build the channels on the thing. Start by wiping all channels existing (e.g. from a previous connect)
             ThingBuilder builder = editThing().withoutChannels(getThing().getChannels());
-            // Add the channels determined above.
-            for (BalboaChannel channel : channels.values()) {
-                builder.withChannel(channel.getChannel());
-            }
+            // Add the channels determined above, sorted alphabetically by channel id. The backing map's iteration
+            // order is hash-based, not insertion order, so without this the channel list order in the UI would be
+            // effectively random.
+            channels.values().stream().sorted(Comparator.comparing(channel -> channel.getChannelUID().getId()))
+                    .forEach(channel -> builder.withChannel(channel.getChannel()));
 
             // Update the thing with the channels
             updateThing(builder.build());
@@ -511,6 +546,12 @@ public class BalboaHandler extends BaseThingHandler implements Handler {
             for (BalboaChannel channel : channels.values()) {
                 channel.handleUpdate(message);
             }
+        }
+
+        // Record that a message was received, regardless of its type - this is what last-seen reports.
+        BalboaChannel lastSeen = channels.get(new ChannelUID(thing.getUID(), "last-seen"));
+        if (lastSeen instanceof LastSeenChannel) {
+            ((LastSeenChannel) lastSeen).markSeen();
         }
     }
 
@@ -530,6 +571,14 @@ public class BalboaHandler extends BaseThingHandler implements Handler {
     // properly. Written from the protocol callback thread (handleUpdate) and read from the framework's
     // command-handling thread (handleCommand), hence volatile.
     private volatile boolean celciusDisplay, temperatureHighRange;
+
+    // The desired target temperature for each range, used by target-temperature-high/target-temperature-low (see
+    // DesiredTemperatureChannel). The unit's "set temperature" message has no range selector of its own - it always
+    // applies to whichever range is currently active - so a desired value for the range that is NOT active right
+    // now cannot be sent immediately. It is cached here instead and pushed once the unit reports a switch into
+    // that range (see TemperatureRange#handleUpdate). NaN means "not known yet" (nothing commanded and no status
+    // update decoded for that range since startup/reconnect). Same threading rationale as above, hence volatile.
+    private volatile double desiredHighTarget = Double.NaN, desiredLowTarget = Double.NaN;
 
     /**
      * Channels exposed by the Balboa Unit are handled by classes implementing the {@link BalboaChannel} interface.
@@ -992,12 +1041,27 @@ public class BalboaHandler extends BaseThingHandler implements Handler {
         public void handleUpdate(BalboaMessage message) {
             // Only status update messages are of interest
             if (message instanceof BalboaMessage.StatusUpdateMessage) {
+                BalboaMessage.StatusUpdateMessage status = (BalboaMessage.StatusUpdateMessage) message;
+                boolean newHighRange = status.getItem(ItemType.TEMPERATURE_RANGE, 0) != 0x00;
+                boolean rangeChanged = newHighRange != temperatureHighRange;
                 // Remember the state at handler level, since it is needed when setting the target temperature.
-                temperatureHighRange = ((BalboaMessage.StatusUpdateMessage) message).getItem(ItemType.TEMPERATURE_RANGE,
-                        0) != 0x00;
+                temperatureHighRange = newHighRange;
                 // Make the update
                 updateState(getChannelUID(),
                         temperatureHighRange ? StringType.valueOf("HIGH") : StringType.valueOf("LOW"));
+
+                // We just switched range. If a desired value was remembered for the range we switched into (see
+                // DesiredTemperatureChannel) and it does not match what the unit now reports for it - e.g. it was
+                // last set to something else in a previous session - push it once so the range behaves like an
+                // independent setpoint instead of whatever the unit happened to remember.
+                if (rangeChanged) {
+                    double desired = temperatureHighRange ? desiredHighTarget : desiredLowTarget;
+                    double rawState = status.getTemperature(true);
+                    if (!Double.isNaN(desired) && rawState >= 0 && Math.abs(desired - rawState) > 0.4) {
+                        protocol.sendMessage(
+                                new BalboaMessage.SetTemperatureMessage(desired, celciusDisplay, temperatureHighRange));
+                    }
+                }
             }
         }
     }
@@ -1129,6 +1193,446 @@ public class BalboaHandler extends BaseThingHandler implements Handler {
                 }
                 // Make the update
                 updateState(getChannelUID(), state);
+            }
+        }
+    }
+
+    /**
+     * Handles the fault code channel, showing the most recent entry from the Balboa unit's fault log (a numeric
+     * code, e.g. "sensor A fault" or "low flow"), or "NONE" if the log is empty.
+     *
+     * @author Carsten Mogge
+     */
+    private class FaultCodeChannel extends BaseBalboaChannel {
+        // Maps the numeric fault/message codes used in the fault log to a short, readable description. Codes not
+        // in this map (Balboa does not publish the full list) are shown as "Fault <code>" instead.
+        // Note: not static - inner classes may not declare static fields other than compile-time constants, and a
+        // Map is not one; this is cheap to build once per (singleton) channel instance.
+        // @formatter:off
+        private final Map<Integer, String> faultCodes = Map.ofEntries(
+                Map.entry(15, "Sensors out of sync"),
+                Map.entry(16, "Low flow"),
+                Map.entry(17, "Flow failed"),
+                Map.entry(18, "Settings reset"),
+                Map.entry(19, "Priming mode"),
+                Map.entry(20, "Clock failed"),
+                Map.entry(21, "Settings reset"),
+                Map.entry(22, "Memory failure"),
+                Map.entry(26, "Sensor sync (service)"),
+                Map.entry(27, "Heater dry"),
+                Map.entry(28, "Heater may be dry"),
+                Map.entry(29, "Water too hot"),
+                Map.entry(30, "Heater too hot"),
+                Map.entry(31, "Sensor A fault"),
+                Map.entry(32, "Sensor B fault"),
+                Map.entry(34, "Pump stuck on"),
+                Map.entry(35, "Hot fault"),
+                Map.entry(36, "GFCI test failed"),
+                Map.entry(37, "Standby mode"));
+        // @formatter:on
+
+        protected FaultCodeChannel() {
+            super("fault-code", "Last Fault", "fault-code", "String");
+        }
+
+        /**
+         * The channel is read only, no action will be taken.
+         */
+        @Override
+        public void handleCommand(Command command) {
+            if (command instanceof RefreshType) {
+                // Status is refreshed periodically by the protocol, no action is needed.
+            } else {
+                logger.warn("Fault code channel received update of type {}", command.getClass().getSimpleName());
+            }
+        }
+
+        /**
+         * Updates the channel state from fault log messages.
+         */
+        @Override
+        public void handleUpdate(BalboaMessage message) {
+            if (message instanceof BalboaMessage.FaultLogResponseMessage) {
+                BalboaMessage.FaultLogResponseMessage fault = (BalboaMessage.FaultLogResponseMessage) message;
+                if (fault.getFaultCount() == 0) {
+                    updateState(getChannelUID(), StringType.valueOf("NONE"));
+                } else {
+                    int code = fault.getFaultCode();
+                    updateState(getChannelUID(), StringType.valueOf(faultCodes.getOrDefault(code, "Fault " + code)));
+                }
+            }
+        }
+    }
+
+    /**
+     * Handles the fault time channel, showing when the most recent fault log entry occurred (best effort - the
+     * unit only reports "days ago" plus a time of day, not an exact date), or "-" if the log is empty.
+     *
+     * @author Carsten Mogge
+     */
+    private class FaultTimeChannel extends BaseBalboaChannel {
+        protected FaultTimeChannel() {
+            super("fault-time", "Last Fault Time", "fault-time", "String");
+        }
+
+        /**
+         * The channel is read only, no action will be taken.
+         */
+        @Override
+        public void handleCommand(Command command) {
+            if (command instanceof RefreshType) {
+                // Status is refreshed periodically by the protocol, no action is needed.
+            } else {
+                logger.warn("Fault time channel received update of type {}", command.getClass().getSimpleName());
+            }
+        }
+
+        /**
+         * Updates the channel state from fault log messages.
+         */
+        @Override
+        public void handleUpdate(BalboaMessage message) {
+            if (message instanceof BalboaMessage.FaultLogResponseMessage) {
+                BalboaMessage.FaultLogResponseMessage fault = (BalboaMessage.FaultLogResponseMessage) message;
+                if (fault.getFaultCount() == 0) {
+                    updateState(getChannelUID(), StringType.valueOf("-"));
+                } else {
+                    int daysAgo = fault.getDaysAgo();
+                    String when = daysAgo == 0 ? "today" : daysAgo == 1 ? "1 day ago" : daysAgo + " days ago";
+                    updateState(getChannelUID(), StringType
+                            .valueOf(String.format("%s at %02d:%02d", when, fault.getHour(), fault.getMinute())));
+                }
+            }
+        }
+    }
+
+    /**
+     * Reports the timestamp of the most recently received message from the unit, regardless of its type. Updated
+     * centrally in {@link #onMessage(BalboaMessage)} rather than in {@link #handleUpdate(BalboaMessage)}, since it
+     * does not depend on the message content. Useful to detect a stale connection independently of the binding's
+     * own watchdog, e.g. via the Expire binding/profile.
+     *
+     * @author Carsten Mogge
+     */
+    private class LastSeenChannel extends BaseBalboaChannel {
+        // Minimum time between two state updates. The unit can report a new message several times a minute while
+        // active (see BalboaProtocol#babble()), but last-seen only needs to be accurate enough for staleness
+        // detection (e.g. via the Expire binding) - updating on every single message would just be event/persistence
+        // noise for no benefit.
+        private static final long MIN_INTERVAL_MILLIS = TimeUnit.SECONDS.toMillis(30);
+
+        private volatile long lastMarkedMillis = 0;
+
+        protected LastSeenChannel() {
+            super("last-seen", "Last Seen", "last-seen", "DateTime");
+        }
+
+        /**
+         * The channel is read only, no action will be taken.
+         */
+        @Override
+        public void handleCommand(Command command) {
+            if (command instanceof RefreshType) {
+                // The state is pushed whenever a message is received, no action is needed.
+            } else {
+                logger.warn("Last seen channel received update of type {}", command.getClass().getSimpleName());
+            }
+        }
+
+        /**
+         * Not tied to any particular message type, see markSeen().
+         */
+        @Override
+        public void handleUpdate(BalboaMessage message) {
+        }
+
+        /**
+         * Records that a message was just received from the unit. Throttled to MIN_INTERVAL_MILLIS - see its
+         * Javadoc.
+         */
+        protected void markSeen() {
+            long now = System.currentTimeMillis();
+            if (now - lastMarkedMillis >= MIN_INTERVAL_MILLIS) {
+                lastMarkedMillis = now;
+                updateState(getChannelUID(), new DateTimeType(ZonedDateTime.now()));
+            }
+        }
+    }
+
+    /**
+     * Selects which field of a filter cycle a {@link FilterCycleTimeChannel} reports.
+     *
+     * @author Carsten Mogge
+     */
+    private enum FilterCycleField {
+        START,
+        DURATION
+    }
+
+    /**
+     * Handles the filter cycle start/duration channels (four of these are instantiated: start and duration, for
+     * filter cycles 1 and 2).
+     *
+     * @author Carsten Mogge
+     */
+    private class FilterCycleTimeChannel extends BaseBalboaChannel {
+        private final int cycle;
+        private final FilterCycleField field;
+
+        /**
+         * Instantiate a filter cycle time channel.
+         *
+         * @param cycle 1 or 2
+         * @param field whether this channel reports the start time or the duration
+         */
+        protected FilterCycleTimeChannel(int cycle, FilterCycleField field, String id, String description) {
+            super(id, description, "filter-cycle-time", "String");
+            this.cycle = cycle;
+            this.field = field;
+        }
+
+        /**
+         * The channel is read only, no action will be taken.
+         */
+        @Override
+        public void handleCommand(Command command) {
+            if (command instanceof RefreshType) {
+                // Status is refreshed periodically by the protocol, no action is needed.
+            } else {
+                logger.warn("Filter cycle channel received update of type {}", command.getClass().getSimpleName());
+            }
+        }
+
+        /**
+         * Updates the channel state from filter cycle messages.
+         */
+        @Override
+        public void handleUpdate(BalboaMessage message) {
+            if (message instanceof BalboaMessage.FilterCyclesResponseMessage) {
+                BalboaMessage.FilterCyclesResponseMessage cycles = (BalboaMessage.FilterCyclesResponseMessage) message;
+                byte hour = field == FilterCycleField.START ? cycles.getStartHour(cycle)
+                        : cycles.getDurationHour(cycle);
+                byte minute = field == FilterCycleField.START ? cycles.getStartMinute(cycle)
+                        : cycles.getDurationMinute(cycle);
+                updateState(getChannelUID(), StringType.valueOf(String.format("%02d:%02d", hour, minute)));
+            }
+        }
+    }
+
+    /**
+     * Handles the filter cycle 2 enabled channel. Filter cycle 1 has no such flag - it is always active.
+     *
+     * @author Carsten Mogge
+     */
+    private class Filter2EnabledChannel extends BaseBalboaChannel {
+        protected Filter2EnabledChannel() {
+            super("filter-2-enabled", "Filter Cycle 2 Enabled", "filter2-enabled", "Contact");
+        }
+
+        /**
+         * The channel is read only, no action will be taken.
+         */
+        @Override
+        public void handleCommand(Command command) {
+            if (command instanceof RefreshType) {
+                // Status is refreshed periodically by the protocol, no action is needed.
+            } else {
+                logger.warn("Filter cycle 2 enabled channel received update of type {}",
+                        command.getClass().getSimpleName());
+            }
+        }
+
+        /**
+         * Updates the channel state from filter cycle messages.
+         */
+        @Override
+        public void handleUpdate(BalboaMessage message) {
+            if (message instanceof BalboaMessage.FilterCyclesResponseMessage) {
+                BalboaMessage.FilterCyclesResponseMessage cycles = (BalboaMessage.FilterCyclesResponseMessage) message;
+                updateState(getChannelUID(), cycles.isFilter2Enabled() ? OpenClosedType.OPEN : OpenClosedType.CLOSED);
+            }
+        }
+    }
+
+    /**
+     * Plain Switch view of the Temperature Range (ON = HIGH, OFF = LOW). Lets a Switch item be linked directly to
+     * this channel, instead of needing a second item bound to the String-valued {@link TemperatureRange} channel
+     * through a profile that maps HIGH/LOW to ON/OFF - two items on one channel like that is what was causing
+     * spurious state bounces, which is also why this channel independently re-derives the active range from each
+     * message instead of relying on {@link BalboaHandler#temperatureHighRange} (channel iteration order across
+     * {@link ChannelMap} is not guaranteed, so that field is not necessarily fresh yet when this runs).
+     *
+     * @author Carsten Mogge
+     */
+    private class TemperatureRangeSwitch extends BaseBalboaChannel {
+        private boolean highRange;
+
+        protected TemperatureRangeSwitch() {
+            super("temperature-range-switch", "Temperature Range (Switch)", "temperature-range-switch", "Switch");
+        }
+
+        /**
+         * Set the temperature range to the desired state
+         */
+        @Override
+        public void handleCommand(Command command) {
+            if (command instanceof OnOffType) {
+                boolean wantHigh = command == OnOffType.ON;
+                if (wantHigh != highRange) {
+                    protocol.sendMessage(new BalboaMessage.ToggleMessage(ItemType.TEMPERATURE_RANGE, 0));
+                }
+            } else if (command instanceof RefreshType) {
+                // Status is sent continuously by the protocol, no action is needed.
+            } else {
+                logger.warn("Temperature Range switch channel received update of type {}",
+                        command.getClass().getSimpleName());
+            }
+        }
+
+        /**
+         * Updates the channel state from status update messages.
+         */
+        @Override
+        public void handleUpdate(BalboaMessage message) {
+            if (message instanceof BalboaMessage.StatusUpdateMessage) {
+                highRange = ((BalboaMessage.StatusUpdateMessage) message).getItem(ItemType.TEMPERATURE_RANGE,
+                        0) != 0x00;
+                updateState(getChannelUID(), highRange ? OnOffType.ON : OnOffType.OFF);
+            }
+        }
+    }
+
+    /**
+     * Plain Switch view of the Heat Mode (ON = READY, OFF = REST or READY_IN_REST). Lets a Switch item be linked
+     * directly to this channel instead of needing a second item bound to the String-valued {@link HeatMode} channel
+     * through a profile - see {@link TemperatureRangeSwitch} for why that pattern is best avoided.
+     *
+     * @author Carsten Mogge
+     */
+    private class HeatModeSwitch extends BaseBalboaChannel {
+        private byte rawState;
+
+        protected HeatModeSwitch() {
+            super("heat-mode-switch", "Heat Mode (Switch)", "heat-mode-switch", "Switch");
+        }
+
+        /**
+         * Set the item to the desired state (ON = READY, OFF = REST)
+         */
+        @Override
+        public void handleCommand(Command command) {
+            if (command instanceof OnOffType) {
+                boolean wantReady = command == OnOffType.ON;
+                boolean isReady = (rawState & 0x01) == 0;
+                if (wantReady != isReady) {
+                    protocol.sendMessage(new BalboaMessage.ToggleMessage(ItemType.HEAT_MODE, 0));
+                }
+            } else if (command instanceof RefreshType) {
+                // Status is sent continuously by the protocol, no action is needed.
+            } else {
+                logger.warn("Heat Mode switch channel received update of type {}", command.getClass().getSimpleName());
+            }
+        }
+
+        /**
+         * Updates the channel state from status update messages.
+         */
+        @Override
+        public void handleUpdate(BalboaMessage message) {
+            if (message instanceof BalboaMessage.StatusUpdateMessage) {
+                rawState = ((BalboaMessage.StatusUpdateMessage) message).getReadyState();
+                // READY (0x00) -> ON; REST (0x01) and READY_IN_REST (0x03) both have the low bit set -> OFF.
+                updateState(getChannelUID(), (rawState & 0x01) == 0 ? OnOffType.ON : OnOffType.OFF);
+            }
+        }
+    }
+
+    /**
+     * Handles a per-range desired target temperature (High or Low). The Balboa unit's "set temperature" message has
+     * no range selector of its own: reading {@link BalboaMessage.SetTemperatureMessage}, the outbound payload is a
+     * single byte carrying only the temperature value - the constructor's {@code highRange} parameter is used
+     * purely to clamp the value to that range's valid limits before sending, it is never put on the wire. So a "set
+     * temperature" command always lands on whichever range is currently active, both here and on the physical
+     * control panel - this is a genuine property of the unit, not a limitation of this binding.
+     * <p>
+     * What the binding CAN do is remember a separate desired value per range and apply the right one automatically:
+     * writing to the channel for the currently active range is sent immediately; writing to the channel for the
+     * other range is only remembered (in {@link BalboaHandler#desiredHighTarget}/{@code desiredLowTarget}) and
+     * pushed once the unit reports a switch into that range (see {@link TemperatureRange#handleUpdate}). This lets
+     * e.g. {@code target-temperature-high} always show and accept "the temperature I want when in High range",
+     * regardless of which range happens to be active right now - unlike the plain {@code target-temperature}
+     * channel, which always reflects the live target of whatever range is currently active.
+     *
+     * @author Carsten Mogge
+     */
+    private class DesiredTemperatureChannel extends BaseBalboaChannel {
+        private final boolean highRange;
+
+        /**
+         * Instantiate a desired temperature item.
+         *
+         * @param highRange whether this channel represents the High range's desired target (otherwise Low)
+         */
+        protected DesiredTemperatureChannel(boolean highRange, String id, String description) {
+            super(id, description, "target-temperature", "Number:Temperature");
+            this.highRange = highRange;
+        }
+
+        /**
+         * Remembers the desired value for this range, and sends it immediately if this range is currently active.
+         */
+        @Override
+        public void handleCommand(Command command) {
+            if (command instanceof QuantityType<?>) {
+                QuantityType<?> target = (QuantityType<?>) command;
+                target = celciusDisplay ? target.toUnit(SIUnits.CELSIUS) : target.toUnit(ImperialUnits.FAHRENHEIT);
+                if (target == null) {
+                    return;
+                }
+                double value = target.doubleValue();
+                if (highRange) {
+                    desiredHighTarget = value;
+                } else {
+                    desiredLowTarget = value;
+                }
+                if (highRange == temperatureHighRange) {
+                    protocol.sendMessage(new BalboaMessage.SetTemperatureMessage(value, celciusDisplay, highRange));
+                }
+            } else if (command instanceof RefreshType) {
+                // Status is sent continuously by the protocol, no action is needed.
+            } else {
+                logger.warn("{} received update of type {}", this.getChannelUID().getId(),
+                        command.getClass().getSimpleName());
+            }
+        }
+
+        /**
+         * Updates the channel state from status update messages. While this range is active, the broadcast target
+         * temperature is authoritative and also becomes the new desired value (so a fresh binding start picks up
+         * whatever is actually on the unit, instead of showing nothing until a value is explicitly commanded).
+         * While this range is not active, the channel keeps showing the last known desired value for it.
+         */
+        @Override
+        public void handleUpdate(BalboaMessage message) {
+            if (message instanceof BalboaMessage.StatusUpdateMessage) {
+                BalboaMessage.StatusUpdateMessage status = (BalboaMessage.StatusUpdateMessage) message;
+                boolean active = status.getItem(ItemType.TEMPERATURE_RANGE, 0) != 0x00;
+                double rawState = status.getTemperature(true);
+                // The unit reports negative numbers (0xFF, casts to -1.0) if the reading is unreliable - discard.
+                if (active == highRange && rawState >= 0) {
+                    if (highRange) {
+                        desiredHighTarget = rawState;
+                    } else {
+                        desiredLowTarget = rawState;
+                    }
+                }
+                double desired = highRange ? desiredHighTarget : desiredLowTarget;
+                if (!Double.isNaN(desired)) {
+                    QuantityType<Temperature> state = status.getCelciusDisplay()
+                            ? new QuantityType<Temperature>(desired, SIUnits.CELSIUS)
+                            : new QuantityType<Temperature>(desired, ImperialUnits.FAHRENHEIT);
+                    updateState(getChannelUID(), state);
+                }
             }
         }
     }
