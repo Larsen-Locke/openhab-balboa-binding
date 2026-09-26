@@ -8,8 +8,8 @@
     "author": "Larsen-Locke",
     "maturity": "unstable",
     "content_type": "application/vnd.openhab.bundle",
-    "url": "https://github.com/Larsen-Locke/openhab-balboa-binding/releases/download/v5.2.1-beta.2/org.openhab.binding.balboa-5.2.1.jar",
-    "link": "https://github.com/Larsen-Locke/openhab-balboa-binding/blob/balboa-oh5/bundles/org.openhab.binding.balboa/README.md",
+    "url": "https://github.com/Larsen-Locke/openhab-balboa-local-binding/releases/download/v5.2.1-beta.2/org.openhab.binding.balboa-5.2.1-beta2.jar",
+    "link": "https://github.com/Larsen-Locke/openhab-balboa-local-binding/blob/balboa-oh5/bundles/org.openhab.binding.balboa/README.md",
     "description": "Connects Balboa hot tub / spa control units (BWA / WiFi Module 50350 and compatible) over TCP/IP. Supports UDP auto-discovery, automatic reconnect with dead-connection detection, and exposes temperature, pumps, lights, blower, mister and filter-cycle status as channels.",
     "compatible_versions": "[5.2.0,6.0.0)"
   }
